@@ -2,6 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
+from sklearn.linear_model import Lasso, LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.metrics import r2_score
+from scipy import stats
+from scipy.stats import jarque_bera, shapiro
+import warnings
+warnings.filterwarnings('ignore')
 
 # 1. Adaptive Series Decomposition (kernel_size 자동 조정)
 class AdaptiveSeriesDecomposition(nn.Module):
@@ -166,10 +174,274 @@ class InformerAutoformerHybrid(nn.Module):
             anomaly_score = None
         return {'forecast': pred, 'anomaly_score': anomaly_score, 'attn_maps': attn_maps, 'seasonal': seasonal, 'trend': trend}
 
-# 6. Example usage
+# 7. Regression Analysis Module (독립적 회귀분석)
+class TrendRegressionAnalyzer:
+    def __init__(self, window_size=50, lasso_alpha=0.01, p_threshold=0.005):
+        """
+        독립적 회귀분석 모듈
+        
+        Args:
+            window_size: 회귀분석용 sliding window 크기
+            lasso_alpha: Lasso 회귀 정규화 파라미터
+            p_threshold: 선형/비선형성 판정 p-value 임계값
+        """
+        self.window_size = window_size
+        self.lasso_alpha = lasso_alpha
+        self.p_threshold = p_threshold
+        
+        # 회귀 모델들
+        self.linear_reg = LinearRegression()
+        self.lasso_reg = Lasso(alpha=lasso_alpha, max_iter=1000)
+        self.poly_features = PolynomialFeatures(degree=2, include_bias=False)
+        
+        # 결과 저장
+        self.trend_results = []
+        self.linearity_results = []
+        
+    def sliding_window_analysis(self, data):
+        """
+        슬라이딩 윈도우 기반 회귀분석
+        
+        Args:
+            data: 시계열 데이터 (numpy array or tensor)
+            
+        Returns:
+            dict: 회귀분석 결과
+        """
+        if isinstance(data, torch.Tensor):
+            data = data.detach().cpu().numpy()
+        
+        if len(data.shape) > 1:
+            data = data.flatten()
+            
+        n = len(data)
+        if n < self.window_size:
+            return self._analyze_single_window(data, 0)
+            
+        results = []
+        
+        # 슬라이딩 윈도우 적용
+        for i in range(n - self.window_size + 1):
+            window_data = data[i:i + self.window_size]
+            window_result = self._analyze_single_window(window_data, i)
+            results.append(window_result)
+            
+        return self._aggregate_results(results)
+        
+    def _analyze_single_window(self, window_data, start_idx):
+        """
+        단일 윈도우 회귀분석
+        """
+        n = len(window_data)
+        X = np.arange(n).reshape(-1, 1)
+        y = window_data
+        
+        # 1. 선형 회귀
+        self.linear_reg.fit(X, y)
+        linear_pred = self.linear_reg.predict(X)
+        linear_r2 = r2_score(y, linear_pred)
+        linear_slope = self.linear_reg.coef_[0]
+        
+        # 2. Lasso 회귀
+        self.lasso_reg.fit(X, y)
+        lasso_pred = self.lasso_reg.predict(X)
+        lasso_r2 = r2_score(y, lasso_pred)
+        lasso_slope = self.lasso_reg.coef_[0]
+        
+        # 3. 다항 회귀 (2차)
+        X_poly = self.poly_features.fit_transform(X)
+        poly_reg = LinearRegression()
+        poly_reg.fit(X_poly, y)
+        poly_pred = poly_reg.predict(X_poly)
+        poly_r2 = r2_score(y, poly_pred)
+        
+        # 4. 선형성 검정 (F-test)
+        linear_residuals = y - linear_pred
+        poly_residuals = y - poly_pred
+        
+        # F-통계량 계산
+        rss_linear = np.sum(linear_residuals**2)
+        rss_poly = np.sum(poly_residuals**2)
+        
+        if rss_poly > 0:
+            f_stat = ((rss_linear - rss_poly) / 1) / (rss_poly / (n - 3))
+            p_value = 1 - stats.f.cdf(f_stat, 1, n - 3)
+        else:
+            f_stat = 0
+            p_value = 1.0
+            
+        # 5. 추세 판정
+        trend_direction = self._classify_trend(linear_slope, p_value)
+        
+        # 6. 정규성 검정 (Shapiro-Wilk)
+        try:
+            shapiro_stat, shapiro_p = shapiro(linear_residuals)
+        except:
+            shapiro_stat, shapiro_p = 0, 1
+            
+        # 7. 자기상관 검정 (Durbin-Watson)
+        dw_stat = self._durbin_watson(linear_residuals)
+        
+        return {
+            'start_idx': start_idx,
+            'window_size': n,
+            'linear_r2': linear_r2,
+            'linear_slope': linear_slope,
+            'lasso_r2': lasso_r2,
+            'lasso_slope': lasso_slope,
+            'poly_r2': poly_r2,
+            'f_statistic': f_stat,
+            'p_value': p_value,
+            'is_linear': p_value > self.p_threshold,
+            'trend_direction': trend_direction,
+            'shapiro_stat': shapiro_stat,
+            'shapiro_p': shapiro_p,
+            'durbin_watson': dw_stat,
+            'residuals_std': np.std(linear_residuals)
+        }
+        
+    def _classify_trend(self, slope, p_value):
+        """
+        추세 분류
+        """
+        if p_value <= self.p_threshold:  # 비선형
+            return 'nonlinear'
+        elif abs(slope) < 1e-6:  # 기울기가 거의 0
+            return 'flat'
+        elif slope > 0:
+            if slope > 0.1:
+                return 'strong_increasing'
+            else:
+                return 'weak_increasing'
+        else:
+            if slope < -0.1:
+                return 'strong_decreasing'
+            else:
+                return 'weak_decreasing'
+                
+    def _durbin_watson(self, residuals):
+        """
+        Durbin-Watson 통계량 계산
+        """
+        diff = np.diff(residuals)
+        return np.sum(diff**2) / np.sum(residuals**2)
+        
+    def _aggregate_results(self, results):
+        """
+        윈도우별 결과 집계
+        """
+        if not results:
+            return {}
+            
+        # 평균 통계
+        avg_linear_r2 = np.mean([r['linear_r2'] for r in results])
+        avg_lasso_r2 = np.mean([r['lasso_r2'] for r in results])
+        avg_poly_r2 = np.mean([r['poly_r2'] for r in results])
+        
+        # 추세 분포
+        trends = [r['trend_direction'] for r in results]
+        trend_counts = {trend: trends.count(trend) for trend in set(trends)}
+        dominant_trend = max(trend_counts, key=trend_counts.get)
+        
+        # 선형성 비율
+        linear_ratio = np.mean([r['is_linear'] for r in results])
+        
+        # 평균 기울기
+        avg_slope = np.mean([r['linear_slope'] for r in results])
+        slope_std = np.std([r['linear_slope'] for r in results])
+        
+        return {
+            'summary': {
+                'avg_linear_r2': avg_linear_r2,
+                'avg_lasso_r2': avg_lasso_r2,
+                'avg_poly_r2': avg_poly_r2,
+                'dominant_trend': dominant_trend,
+                'trend_distribution': trend_counts,
+                'linear_ratio': linear_ratio,
+                'avg_slope': avg_slope,
+                'slope_std': slope_std,
+                'total_windows': len(results)
+            },
+            'detailed_results': results
+        }
+        
+    def analyze_trend_stability(self, data):
+        """
+        추세 안정성 분석
+        """
+        results = self.sliding_window_analysis(data)
+        
+        if 'detailed_results' not in results:
+            return {}
+            
+        slopes = [r['linear_slope'] for r in results['detailed_results']]
+        r2_scores = [r['linear_r2'] for r in results['detailed_results']]
+        
+        # 기울기 변화율
+        slope_changes = np.diff(slopes)
+        slope_volatility = np.std(slope_changes)
+        
+        # R² 안정성
+        r2_stability = 1 - (np.std(r2_scores) / (np.mean(r2_scores) + 1e-6))
+        
+        # 추세 변화점 탐지
+        trend_changes = []
+        for i in range(1, len(slopes)):
+            if np.sign(slopes[i]) != np.sign(slopes[i-1]) and abs(slopes[i]) > 1e-6:
+                trend_changes.append(i)
+                
+        return {
+            'slope_volatility': slope_volatility,
+            'r2_stability': r2_stability,
+            'trend_change_points': trend_changes,
+            'num_trend_changes': len(trend_changes),
+            'slope_range': (min(slopes), max(slopes)),
+            'slope_trend': 'increasing' if slopes[-1] > slopes[0] else 'decreasing'
+        }
+
+# 8. Enhanced Hybrid Model with Regression Analysis
+class EnhancedInformerAutoformerHybrid(InformerAutoformerHybrid):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trend_analyzer = TrendRegressionAnalyzer()
+        
+    def forward_with_regression(self, x, y_true=None):
+        """
+        회귀분석이 포함된 forward pass
+        """
+        # 기본 forward
+        basic_output = self.forward(x, y_true)
+        
+        # 추출된 trend에 대한 회귀분석
+        trend_data = basic_output['trend']  # [B, L, D]
+        
+        regression_results = []
+        for b in range(trend_data.size(0)):
+            for d in range(trend_data.size(2)):
+                trend_series = trend_data[b, :, d]
+                reg_result = self.trend_analyzer.sliding_window_analysis(trend_series)
+                regression_results.append(reg_result)
+                
+        # 결과 통합
+        enhanced_output = basic_output.copy()
+        enhanced_output['regression_analysis'] = regression_results
+        enhanced_output['trend_stability'] = [
+            self.trend_analyzer.analyze_trend_stability(trend_data[b, :, d])
+            for b in range(trend_data.size(0))
+            for d in range(trend_data.size(2))
+        ]
+        
+        return enhanced_output
+
+# 6. Example usage with Regression Analysis
 if __name__ == "__main__":
+    # 기본 모델 테스트
     model = InformerAutoformerHybrid(input_dim=3, d_model=64, out_len=24, use_patch=True, patch_len=12, share_params=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    
+    # Enhanced 모델 테스트 (회귀분석 포함)
+    enhanced_model = EnhancedInformerAutoformerHybrid(input_dim=3, d_model=64, out_len=24, use_patch=True, patch_len=12, share_params=True)
+    
+    optimizer = torch.optim.Adam(enhanced_model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
     train_x = torch.randn(100, 96, 3)
     train_y = torch.randn(100, 24)
@@ -177,23 +449,348 @@ if __name__ == "__main__":
         torch.utils.data.TensorDataset(train_x, train_y), batch_size=8, shuffle=True
     )
     thres = DynamicThreshold()
+    
+    # 훈련
     for epoch in range(3):
-        model.train()
+        enhanced_model.train()
         for batch_x, batch_y in train_loader:
             optimizer.zero_grad()
-            out = model(batch_x, batch_y)
+            out = enhanced_model(batch_x, batch_y)
             loss = criterion(out['forecast'], batch_y)
             loss.backward()
             optimizer.step()
         print(f"Epoch {epoch+1} done.")
-    model.eval()
+    
+    # 테스트 및 회귀분석
+    enhanced_model.eval()
     test_x = torch.randn(10, 96, 3)
     test_y = torch.randn(10, 24)
+    
     with torch.no_grad():
-        out = model(test_x, test_y)
+        # 기본 출력
+        out = enhanced_model(test_x, test_y)
         anomaly_score = out['anomaly_score']
         threshold = thres.update(anomaly_score)
         anomaly_mask = (anomaly_score > threshold)
+        
+        print(f"=== 기본 이상탐지 결과 ===")
         print(f"Anomaly Score: {anomaly_score}")
         print(f"Dynamic Threshold: {threshold:.4f}")
         print(f"Anomaly Mask: {anomaly_mask}")
+        
+        # 회귀분석 포함 출력
+        enhanced_out = enhanced_model.forward_with_regression(test_x, test_y)
+        
+        print(f"\n=== 회귀분석 결과 ===")
+        if enhanced_out['regression_analysis']:
+            for i, reg_result in enumerate(enhanced_out['regression_analysis'][:3]):  # 처음 3개만 출력
+                if 'summary' in reg_result:
+                    summary = reg_result['summary']
+                    print(f"Sample {i+1}:")
+                    print(f"  평균 선형 R²: {summary['avg_linear_r2']:.4f}")
+                    print(f"  평균 Lasso R²: {summary['avg_lasso_r2']:.4f}")
+                    print(f"  지배적 추세: {summary['dominant_trend']}")
+                    print(f"  선형성 비율: {summary['linear_ratio']:.4f}")
+                    print(f"  평균 기울기: {summary['avg_slope']:.6f}")
+                    print(f"  추세 분포: {summary['trend_distribution']}")
+        
+        print(f"\n=== 추세 안정성 분석 ===")
+        if enhanced_out['trend_stability']:
+            for i, stability in enumerate(enhanced_out['trend_stability'][:3]):  # 처음 3개만 출력
+                if stability:
+                    print(f"Sample {i+1}:")
+                    print(f"  기울기 변동성: {stability['slope_volatility']:.6f}")
+                    print(f"  R² 안정성: {stability['r2_stability']:.4f}")
+                    print(f"  추세 변화점 수: {stability['num_trend_changes']}")
+                    print(f"  기울기 범위: {stability['slope_range']}")
+                    print(f"  전체 기울기 추세: {stability['slope_trend']}")
+    
+    # 독립적 회귀분석 테스트
+    print(f"\n=== 독립적 회귀분석 테스트 ===")
+    trend_analyzer = TrendRegressionAnalyzer(window_size=30, lasso_alpha=0.01, p_threshold=0.005)
+    
+    # 샘플 시계열 데이터 생성 (선형 + 노이즈)
+    time_steps = np.arange(100)
+    sample_trend = 0.5 * time_steps + 10 + np.random.normal(0, 2, 100)
+    
+    # 회귀분석 수행
+    reg_result = trend_analyzer.sliding_window_analysis(sample_trend)
+    
+    if 'summary' in reg_result:
+        summary = reg_result['summary']
+        print(f"샘플 데이터 회귀분석:")
+        print(f"  평균 선형 R²: {summary['avg_linear_r2']:.4f}")
+        print(f"  평균 Lasso R²: {summary['avg_lasso_r2']:.4f}")
+        print(f"  지배적 추세: {summary['dominant_trend']}")
+        print(f"  선형성 비율: {summary['linear_ratio']:.4f}")
+        print(f"  평균 기울기: {summary['avg_slope']:.6f}")
+        print(f"  기울기 표준편차: {summary['slope_std']:.6f}")
+        print(f"  총 윈도우 수: {summary['total_windows']}")
+    
+    # 추세 안정성 분석
+    stability = trend_analyzer.analyze_trend_stability(sample_trend)
+    print(f"\n추세 안정성:")
+    print(f"  기울기 변동성: {stability['slope_volatility']:.6f}")
+    print(f"  R² 안정성: {stability['r2_stability']:.4f}")
+    print(f"  추세 변화점 수: {stability['num_trend_changes']}")
+    print(f"  기울기 범위: {stability['slope_range']}")
+    print(f"  전체 기울기 추세: {stability['slope_trend']}")
+
+# 7. Regression Analysis Module (독립적 회귀분석)
+class TrendRegressionAnalyzer:
+    def __init__(self, window_size=50, lasso_alpha=0.01, p_threshold=0.005):
+        """
+        독립적 회귀분석 모듈
+        
+        Args:
+            window_size: 회귀분석용 sliding window 크기
+            lasso_alpha: Lasso 회귀 정규화 파라미터
+            p_threshold: 선형/비선형성 판정 p-value 임계값
+        """
+        self.window_size = window_size
+        self.lasso_alpha = lasso_alpha
+        self.p_threshold = p_threshold
+        
+        # 회귀 모델들
+        self.linear_reg = LinearRegression()
+        self.lasso_reg = Lasso(alpha=lasso_alpha, max_iter=1000)
+        self.poly_features = PolynomialFeatures(degree=2, include_bias=False)
+        
+        # 결과 저장
+        self.trend_results = []
+        self.linearity_results = []
+        
+    def sliding_window_analysis(self, data):
+        """
+        슬라이딩 윈도우 기반 회귀분석
+        
+        Args:
+            data: 시계열 데이터 (numpy array or tensor)
+            
+        Returns:
+            dict: 회귀분석 결과
+        """
+        if isinstance(data, torch.Tensor):
+            data = data.detach().cpu().numpy()
+        
+        if len(data.shape) > 1:
+            data = data.flatten()
+            
+        n = len(data)
+        if n < self.window_size:
+            return self._analyze_single_window(data, 0)
+            
+        results = []
+        
+        # 슬라이딩 윈도우 적용
+        for i in range(n - self.window_size + 1):
+            window_data = data[i:i + self.window_size]
+            window_result = self._analyze_single_window(window_data, i)
+            results.append(window_result)
+            
+        return self._aggregate_results(results)
+        
+    def _analyze_single_window(self, window_data, start_idx):
+        """
+        단일 윈도우 회귀분석
+        """
+        n = len(window_data)
+        X = np.arange(n).reshape(-1, 1)
+        y = window_data
+        
+        # 1. 선형 회귀
+        self.linear_reg.fit(X, y)
+        linear_pred = self.linear_reg.predict(X)
+        linear_r2 = r2_score(y, linear_pred)
+        linear_slope = self.linear_reg.coef_[0]
+        
+        # 2. Lasso 회귀
+        self.lasso_reg.fit(X, y)
+        lasso_pred = self.lasso_reg.predict(X)
+        lasso_r2 = r2_score(y, lasso_pred)
+        lasso_slope = self.lasso_reg.coef_[0]
+        
+        # 3. 다항 회귀 (2차)
+        X_poly = self.poly_features.fit_transform(X)
+        poly_reg = LinearRegression()
+        poly_reg.fit(X_poly, y)
+        poly_pred = poly_reg.predict(X_poly)
+        poly_r2 = r2_score(y, poly_pred)
+        
+        # 4. 선형성 검정 (F-test)
+        linear_residuals = y - linear_pred
+        poly_residuals = y - poly_pred
+        
+        # F-통계량 계산
+        rss_linear = np.sum(linear_residuals**2)
+        rss_poly = np.sum(poly_residuals**2)
+        
+        if rss_poly > 0:
+            f_stat = ((rss_linear - rss_poly) / 1) / (rss_poly / (n - 3))
+            p_value = 1 - stats.f.cdf(f_stat, 1, n - 3)
+        else:
+            f_stat = 0
+            p_value = 1.0
+            
+        # 5. 추세 판정
+        trend_direction = self._classify_trend(linear_slope, p_value)
+        
+        # 6. 정규성 검정 (Shapiro-Wilk)
+        try:
+            shapiro_stat, shapiro_p = shapiro(linear_residuals)
+        except:
+            shapiro_stat, shapiro_p = 0, 1
+            
+        # 7. 자기상관 검정 (Durbin-Watson)
+        dw_stat = self._durbin_watson(linear_residuals)
+        
+        return {
+            'start_idx': start_idx,
+            'window_size': n,
+            'linear_r2': linear_r2,
+            'linear_slope': linear_slope,
+            'lasso_r2': lasso_r2,
+            'lasso_slope': lasso_slope,
+            'poly_r2': poly_r2,
+            'f_statistic': f_stat,
+            'p_value': p_value,
+            'is_linear': p_value > self.p_threshold,
+            'trend_direction': trend_direction,
+            'shapiro_stat': shapiro_stat,
+            'shapiro_p': shapiro_p,
+            'durbin_watson': dw_stat,
+            'residuals_std': np.std(linear_residuals)
+        }
+        
+    def _classify_trend(self, slope, p_value):
+        """
+        추세 분류
+        """
+        if p_value <= self.p_threshold:  # 비선형
+            return 'nonlinear'
+        elif abs(slope) < 1e-6:  # 기울기가 거의 0
+            return 'flat'
+        elif slope > 0:
+            if slope > 0.1:
+                return 'strong_increasing'
+            else:
+                return 'weak_increasing'
+        else:
+            if slope < -0.1:
+                return 'strong_decreasing'
+            else:
+                return 'weak_decreasing'
+                
+    def _durbin_watson(self, residuals):
+        """
+        Durbin-Watson 통계량 계산
+        """
+        diff = np.diff(residuals)
+        return np.sum(diff**2) / np.sum(residuals**2)
+        
+    def _aggregate_results(self, results):
+        """
+        윈도우별 결과 집계
+        """
+        if not results:
+            return {}
+            
+        # 평균 통계
+        avg_linear_r2 = np.mean([r['linear_r2'] for r in results])
+        avg_lasso_r2 = np.mean([r['lasso_r2'] for r in results])
+        avg_poly_r2 = np.mean([r['poly_r2'] for r in results])
+        
+        # 추세 분포
+        trends = [r['trend_direction'] for r in results]
+        trend_counts = {trend: trends.count(trend) for trend in set(trends)}
+        dominant_trend = max(trend_counts, key=trend_counts.get)
+        
+        # 선형성 비율
+        linear_ratio = np.mean([r['is_linear'] for r in results])
+        
+        # 평균 기울기
+        avg_slope = np.mean([r['linear_slope'] for r in results])
+        slope_std = np.std([r['linear_slope'] for r in results])
+        
+        return {
+            'summary': {
+                'avg_linear_r2': avg_linear_r2,
+                'avg_lasso_r2': avg_lasso_r2,
+                'avg_poly_r2': avg_poly_r2,
+                'dominant_trend': dominant_trend,
+                'trend_distribution': trend_counts,
+                'linear_ratio': linear_ratio,
+                'avg_slope': avg_slope,
+                'slope_std': slope_std,
+                'total_windows': len(results)
+            },
+            'detailed_results': results
+        }
+        
+    def analyze_trend_stability(self, data):
+        """
+        추세 안정성 분석
+        """
+        results = self.sliding_window_analysis(data)
+        
+        if 'detailed_results' not in results:
+            return {}
+            
+        slopes = [r['linear_slope'] for r in results['detailed_results']]
+        r2_scores = [r['linear_r2'] for r in results['detailed_results']]
+        
+        # 기울기 변화율
+        slope_changes = np.diff(slopes)
+        slope_volatility = np.std(slope_changes)
+        
+        # R² 안정성
+        r2_stability = 1 - (np.std(r2_scores) / (np.mean(r2_scores) + 1e-6))
+        
+        # 추세 변화점 탐지
+        trend_changes = []
+        for i in range(1, len(slopes)):
+            if np.sign(slopes[i]) != np.sign(slopes[i-1]) and abs(slopes[i]) > 1e-6:
+                trend_changes.append(i)
+                
+        return {
+            'slope_volatility': slope_volatility,
+            'r2_stability': r2_stability,
+            'trend_change_points': trend_changes,
+            'num_trend_changes': len(trend_changes),
+            'slope_range': (min(slopes), max(slopes)),
+            'slope_trend': 'increasing' if slopes[-1] > slopes[0] else 'decreasing'
+        }
+
+# 8. Enhanced Hybrid Model with Regression Analysis
+class EnhancedInformerAutoformerHybrid(InformerAutoformerHybrid):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trend_analyzer = TrendRegressionAnalyzer()
+        
+    def forward_with_regression(self, x, y_true=None):
+        """
+        회귀분석이 포함된 forward pass
+        """
+        # 기본 forward
+        basic_output = self.forward(x, y_true)
+        
+        # 추출된 trend에 대한 회귀분석
+        trend_data = basic_output['trend']  # [B, L, D]
+        
+        regression_results = []
+        for b in range(trend_data.size(0)):
+            for d in range(trend_data.size(2)):
+                trend_series = trend_data[b, :, d]
+                reg_result = self.trend_analyzer.sliding_window_analysis(trend_series)
+                regression_results.append(reg_result)
+                
+        # 결과 통합
+        enhanced_output = basic_output.copy()
+        enhanced_output['regression_analysis'] = regression_results
+        enhanced_output['trend_stability'] = [
+            self.trend_analyzer.analyze_trend_stability(trend_data[b, :, d])
+            for b in range(trend_data.size(0))
+            for d in range(trend_data.size(2))
+        ]
+        
+        return enhanced_output
